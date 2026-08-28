@@ -6,15 +6,18 @@
 #   MTPSERVE_MODEL_DIR=/path ...  — использовать уже скачанную MLX-модель
 #
 # Переменные:
-#   MTPSERVE_MODEL       HF-репозиторий MLX-модели (orcarouter/Qwen3.8-27B-Uncensored-MLX)
-#   MTPSERVE_MTP_SOURCE  оригинальный чекпойнт с mtp-тензорами (Qwen/Qwen3.8-27B)
-#   MTPSERVE_MODEL_DIR   готовый локальный каталог модели (пропускает скачивание)
-#   MTPSERVE_MODELS      куда качать модели (~/.cache/mtpserve/models)
+#   MTPSERVE_MODEL         HF-репозиторий MLX-модели (orcarouter/Qwen3.8-27B-Uncensored-MLX)
+#   MTPSERVE_MODEL_SUBDIR  подкаталог с нужным квантом внутри репо (по умолчанию 4-bit);
+#                          пусто = качать репозиторий целиком (репо без подкаталогов)
+#   MTPSERVE_MTP_SOURCE    оригинальный чекпойнт с mtp-тензорами (Qwen/Qwen3.8-27B)
+#   MTPSERVE_MODEL_DIR     готовый локальный каталог модели (пропускает скачивание)
+#   MTPSERVE_MODELS        куда качать модели (~/.cache/mtpserve/models)
 
 set -eu
 
 REPO_DIR=$(cd "$(dirname "$0")" && pwd)
 MODEL_HF="${MTPSERVE_MODEL:-orcarouter/Qwen3.8-27B-Uncensored-MLX}"
+MODEL_SUBDIR="${MTPSERVE_MODEL_SUBDIR-4-bit}"
 SOURCE_HF="${MTPSERVE_MTP_SOURCE:-Qwen/Qwen3.8-27B}"
 MODELS_DIR="${MTPSERVE_MODELS:-$HOME/.cache/mtpserve/models}"
 
@@ -44,17 +47,28 @@ if [ -n "${MTPSERVE_MODEL_DIR:-}" ]; then
     [ -f "$MODEL_DIR/config.json" ] || die "в $MODEL_DIR нет config.json"
     say "модель: $MODEL_DIR (локальная)"
 else
-    MODEL_DIR="$MODELS_DIR/$(basename "$MODEL_HF")"
+    DL_ROOT="$MODELS_DIR/$(basename "$MODEL_HF")"
+    if [ -n "$MODEL_SUBDIR" ]; then
+        MODEL_DIR="$DL_ROOT/$MODEL_SUBDIR"
+    else
+        MODEL_DIR="$DL_ROOT"
+    fi
     if [ -f "$MODEL_DIR/config.json" ]; then
         say "модель уже скачана: $MODEL_DIR"
     else
-        say "качаю $MODEL_HF -> $MODEL_DIR (~16 GB)"
-        mkdir -p "$MODELS_DIR"
-        uv run python - "$MODEL_HF" "$MODEL_DIR" <<'PY'
+        say "качаю $MODEL_HF${MODEL_SUBDIR:+/$MODEL_SUBDIR} -> $MODEL_DIR (~16 GB)"
+        mkdir -p "$DL_ROOT"
+        # Репо содержит несколько квантов в подкаталогах (2/4/6/8-bit);
+        # без allow_patterns snapshot_download тянет все ~90 GB. Берём только нужный.
+        uv run python - "$MODEL_HF" "$DL_ROOT" "$MODEL_SUBDIR" <<'PY'
 import sys
 from huggingface_hub import snapshot_download
-snapshot_download(sys.argv[1], local_dir=sys.argv[2])
+repo, dest, subdir = sys.argv[1], sys.argv[2], sys.argv[3]
+patterns = [f"{subdir}/*"] if subdir else None
+snapshot_download(repo, local_dir=dest, allow_patterns=patterns)
 PY
+        [ -f "$MODEL_DIR/config.json" ] || \
+            die "после скачивания нет $MODEL_DIR/config.json — проверь MTPSERVE_MODEL_SUBDIR"
     fi
 fi
 
