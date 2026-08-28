@@ -24,6 +24,17 @@ XML `<function=...>`), `reasoning_content` extraction, `/metrics`.
 
 ## Setup
 
+One command from scratch (installs uv if missing, downloads the model
+~16 GB, builds the MTP head ~3 GB download, runs a smoke test):
+
+```sh
+sh install.sh
+# already have the MLX model locally?
+MTPSERVE_MODEL_DIR=/path/to/your-mlx-model sh install.sh
+```
+
+Or manually:
+
 ```sh
 uv sync
 
