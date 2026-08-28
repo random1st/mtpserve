@@ -291,6 +291,9 @@ def decode_ids(model, tokenizer, ids, max_tokens, use_mtp, prefill_step=2048,
 
         draft_logits = model.mtp_forward(_h(h_in), t_in, mtp_cache=mtp_cache)
         draft = mx.argmax(draft_logits[:, -1, :], axis=-1)
+        # Конвейер: голова стартует на GPU, пока Python снимает снимок и
+        # строит граф verify — иначе GPU простаивает на постройке графа.
+        mx.async_eval(draft)
 
         snaps = _snapshot_recurrent(cache)
         verify_in = mx.concatenate([primary[:, None], draft[:, None]], axis=1)
