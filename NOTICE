@@ -1,0 +1,10 @@
+mtpserve
+Copyright 2026 Roman Voronin
+
+This product includes software developed in the vllm-mlx project
+(https://github.com/waybarrios/vllm-mlx), licensed under the Apache License 2.0:
+  - mtpserve/qwen3_5_mtp.py (vendored, modified)
+  - scripts/add_mtp_weights.py (vendored)
+
+Built on MLX (https://github.com/ml-explore/mlx) and mlx-lm
+(https://github.com/ml-explore/mlx-lm), MIT License.
