@@ -64,3 +64,38 @@ draft acceptance to zero.
 
 Single sequence, single process; requests are serialized. That is the
 intended use: one local agent, minimum latency.
+
+
+## Experimental checkpoint mode
+
+```sh
+uv run python bench.py --checkpoint-mtp
+uv run mtpserve --model /path/to/your-mlx-model --checkpoint-mtp
+# Optional depth-two verifier with both reject checkpoints:
+uv run python bench.py --checkpoint-mtp --mtp-depth 2
+uv run mtpserve --model /path/to/your-mlx-model --checkpoint-mtp --mtp-depth 2
+```
+
+This opt-in path shares Q4 weight reads using the ordinary one-token arithmetic
+and retains the recurrent states needed when an MTP draft is rejected. Sharing
+is limited to checkpoint verification; prefill and the draft head keep their
+original execution. Depth defaults to one; `--mtp-depth 2` enables two draft
+tokens, exact three-row Q4 verification, and separate states after P and P,D1
+for either rejection. Both depths remain experimental. The benchmark uses the
+same weights and prompts; its excluded warmup verifies actual projection coverage, then diagnostic counters are disabled
+for measurement. The server flag selects the same verification path and is
+mutually exclusive with `--no-mtp`.
+The supported kernel is BF16, affine Q4/group64 with K divisible by 512 and N
+by 8. Unsupported quantized projections are rejected before model mutation.
+The adapter restores the original model classes when the benchmark or server
+stops. In the experimental server mode, socket I/O waits are limited to
+30 seconds so idle HTTP connections cannot hold shutdown indefinitely; this
+does not impose a generation deadline.
+
+Both depths matched ordinary greedy output on four short prompts. Depth two
+also passed full-model state, prompt reuse, 2050-token context and forced
+rejection controls. Its canonical 2409-token run measured 29.23 tok/s on the
+tested M3 Max; a sustained speedup over depth one and the 90% hardware target
+remain unproven. See [performance evidence](PERFORMANCE.md)
+for timing, thermal limits and validation scope. The default benchmark remains
+`uv run python bench.py`.

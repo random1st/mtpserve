@@ -13,6 +13,7 @@
 """
 
 import argparse
+from contextlib import nullcontext
 import hashlib
 import json
 import os
@@ -38,8 +39,10 @@ MODEL = None
 TOKENIZER = None
 MODEL_ID = ""
 LOCK = threading.Lock()
-STATE = {"v": None}          # переиспользуемый префикс между запросами
+STATE = {"v": None}  # переиспользуемый префикс между запросами
 USE_MTP = True
+USE_CHECKPOINT_MTP = False
+MTP_DEPTH = 1
 
 # Все MLX-вычисления — в одном выделенном потоке. ThreadingHTTPServer даёт
 # каждому запросу свежий поток; массивы из STATE (логиты, кэш) привязаны к
@@ -71,10 +74,12 @@ def run_in_worker(fn, *args):
         raise out["err"]
     return out["res"]
 
+
 TOOL_CALL_RE = re.compile(r"<tool_call>\s*(\{.*?\})\s*</tool_call>", re.S)
 # Qwen3.5/3.8: XML-диалект того же тега — <function=имя><parameter=ключ>...
 TOOL_CALL_XML_RE = re.compile(
-    r"<tool_call>\s*<function=([\w.-]+)>(.*?)</function>\s*</tool_call>", re.S)
+    r"<tool_call>\s*<function=([\w.-]+)>(.*?)</function>\s*</tool_call>", re.S
+)
 PARAM_XML_RE = re.compile(r"<parameter=([\w.-]+)>\n?(.*?)\n?</parameter>", re.S)
 # decode() не срезает спецтокены — они утекают в content
 SPECIAL_RE = re.compile(r"<\|im_end\|>|<\|im_start\|>|<\|endoftext\|>")
@@ -93,8 +98,7 @@ def build_ids(messages, tools):
                     fn["arguments"] = json.loads(fn["arguments"])
                 except json.JSONDecodeError:
                     pass
-    kw = {"add_generation_prompt": True, "tokenize": True,
-          "enable_thinking": False}
+    kw = {"add_generation_prompt": True, "tokenize": True, "enable_thinking": False}
     if tools:
         kw["tools"] = tools
     return TOKENIZER.apply_chat_template(messages, **kw)
@@ -119,7 +123,9 @@ def _make_call(name, args):
         "function": {
             "name": name,
             # OpenAI ждёт arguments строкой, а не объектом
-            "arguments": args if isinstance(args, str) else json.dumps(args, ensure_ascii=False),
+            "arguments": args
+            if isinstance(args, str)
+            else json.dumps(args, ensure_ascii=False),
         },
     }
 
@@ -151,8 +157,10 @@ def split_tool_calls(text, tools=None):
         calls.append(_make_call(payload.get("name", ""), payload.get("arguments", {})))
     for m in TOOL_CALL_XML_RE.finditer(text):
         name = m.group(1)
-        args = {k: _coerce_arg(k, v, schemas.get(name)) for k, v in
-                PARAM_XML_RE.findall(m.group(2))}
+        args = {
+            k: _coerce_arg(k, v, schemas.get(name))
+            for k, v in PARAM_XML_RE.findall(m.group(2))
+        }
         calls.append(_make_call(name, args))
 
     clean = TOOL_CALL_XML_RE.sub("", TOOL_CALL_RE.sub("", text))
@@ -168,13 +176,18 @@ def split_tool_calls(text, tools=None):
 PIN = {"ids": None, "states": None, "mtp_states": None}
 LAST_INITIAL = {"ids": None}
 PIN_MIN_TOKENS = 64
-PIN_DIR = Path(os.environ.get("MTPSERVE_CACHE",
-                              Path.home() / ".cache" / "mtpserve"))
+PIN_DIR = Path(os.environ.get("MTPSERVE_CACHE", Path.home() / ".cache" / "mtpserve"))
 
-STATS = {"requests": 0, "gen_tokens": 0, "attempted": 0, "accepted": 0,
-         "cached_tokens": 0, "computed_tokens": 0,
-         "starts": {"exact": 0, "extension": 0, "pin": 0, "miss": 0},
-         "started_at": time.time()}
+STATS = {
+    "requests": 0,
+    "gen_tokens": 0,
+    "attempted": 0,
+    "accepted": 0,
+    "cached_tokens": 0,
+    "computed_tokens": 0,
+    "starts": {"exact": 0, "extension": 0, "pin": 0, "miss": 0},
+    "started_at": time.time(),
+}
 
 
 def _pin_paths():
@@ -194,8 +207,9 @@ def _flatten_states(states, prefix):
                     slots.append("arr")
                 else:
                     slots.append({"raw": x})
-            meta.append({"kind": "tuple" if isinstance(st, tuple) else "list",
-                         "slots": slots})
+            meta.append(
+                {"kind": "tuple" if isinstance(st, tuple) else "list", "slots": slots}
+            )
         elif isinstance(st, mx.array):
             tensors[f"{prefix}{i}"] = st
             meta.append({"kind": "arr"})
@@ -208,8 +222,10 @@ def _unflatten_states(tensors, meta, prefix):
     states = []
     for i, m in enumerate(meta):
         if m["kind"] in ("tuple", "list"):
-            st = [tensors[f"{prefix}{i}.{j}"] if s == "arr" else s["raw"]
-                  for j, s in enumerate(m["slots"])]
+            st = [
+                tensors[f"{prefix}{i}.{j}"] if s == "arr" else s["raw"]
+                for j, s in enumerate(m["slots"])
+            ]
             states.append(tuple(st) if m["kind"] == "tuple" else st)
         elif m["kind"] == "arr":
             states.append(tensors[f"{prefix}{i}"])
@@ -229,11 +245,19 @@ def _save_pin():
             mtp_tensors, mtp_meta = _flatten_states(PIN["mtp_states"], "M")
             tensors.update(mtp_tensors)
         mx.save_safetensors(str(st_path), tensors)
-        meta_path.write_text(json.dumps(
-            {"model": MODEL_ID, "ids": PIN["ids"],
-             "layers": meta, "mtp_layers": mtp_meta}))
-        print(f"pin: сохранён на диск ({st_path.stat().st_size/1e6:.0f} MB)",
-              flush=True)
+        meta_path.write_text(
+            json.dumps(
+                {
+                    "model": MODEL_ID,
+                    "ids": PIN["ids"],
+                    "layers": meta,
+                    "mtp_layers": mtp_meta,
+                }
+            )
+        )
+        print(
+            f"pin: сохранён на диск ({st_path.stat().st_size / 1e6:.0f} MB)", flush=True
+        )
     except Exception as e:  # noqa: BLE001 — пин это ускорение, не обязанность
         print(f"pin: не сохранился на диск: {e}", flush=True)
 
@@ -248,6 +272,7 @@ def _load_pin():
             return
         if bool(meta.get("mtp_layers")) != USE_MTP:
             return
+
         # Материализуем в MLX-воркере: ленивые массивы mx.load живут в
         # стриме создавшего потока, а пользоваться ими будет воркер.
         def _job():
@@ -260,7 +285,9 @@ def _load_pin():
         PIN["states"] = _unflatten_states(tensors, meta["layers"], "L")
         PIN["mtp_states"] = (
             _unflatten_states(tensors, meta["mtp_layers"], "M")
-            if meta.get("mtp_layers") else None)
+            if meta.get("mtp_layers")
+            else None
+        )
         print(f"pin: загружен с диска ({len(PIN['ids'])} токенов)", flush=True)
     except Exception as e:  # noqa: BLE001
         print(f"pin: не загрузился с диска: {e}", flush=True)
@@ -293,15 +320,18 @@ def _pin_prefix(pin_ids):
     cache = make_prompt_cache(MODEL)
     mtp_cache = MODEL.make_mtp_cache() if USE_MTP else None
     t = time.time()
-    _, hidden = _prefill(MODEL, pin_ids, cache, 2048,
-                         collect_hidden=(mtp_cache is not None))
+    _, hidden = _prefill(
+        MODEL, pin_ids, cache, 2048, collect_hidden=(mtp_cache is not None)
+    )
     if mtp_cache is not None:
         _mtp_prefill(MODEL, hidden, pin_ids, mtp_cache, 2048)
     PIN["ids"] = list(pin_ids)
     PIN["states"] = [c.state for c in cache]
     PIN["mtp_states"] = [c.state for c in mtp_cache] if mtp_cache else None
-    print(f"pin: закреплён префикс {len(pin_ids)} токенов за {time.time()-t:.1f}s",
-          flush=True)
+    print(
+        f"pin: закреплён префикс {len(pin_ids)} токенов за {time.time() - t:.1f}s",
+        flush=True,
+    )
     _save_pin()
 
 
@@ -315,22 +345,34 @@ def _restore_pin():
         mtp_cache = MODEL.make_mtp_cache()
         for c, st in zip(mtp_cache, PIN["mtp_states"]):
             c.state = _copy_state(st)
-    return {"ids": list(PIN["ids"]), "cache": cache, "mtp_cache": mtp_cache,
-            "snap": {}, "kv_len": len(PIN["ids"]),
-            "prompt_logits": None, "prompt_hidden": None}
+    return {
+        "ids": list(PIN["ids"]),
+        "cache": cache,
+        "mtp_cache": mtp_cache,
+        "prompt_mtp_offsets": [c.offset for c in mtp_cache] if mtp_cache else None,
+        "snap": {},
+        "kv_len": len(PIN["ids"]),
+        "prompt_logits": None,
+        "prompt_hidden": None,
+    }
 
 
 def _decode_job(ids, max_tokens):
     st = STATE["v"]
     ids_l = list(ids)
     extends_last = bool(
-        st and st.get("ids")
-        and (st["ids"] == ids_l
-             or (len(st["ids"]) < len(ids_l)
-                 and ids_l[:len(st["ids"])] == st["ids"]))
+        st
+        and st.get("ids")
+        and (
+            st["ids"] == ids_l
+            or (len(st["ids"]) < len(ids_l) and ids_l[: len(st["ids"])] == st["ids"])
+        )
     )
-    start = "exact" if (extends_last and st["ids"] == ids_l) else (
-        "extension" if extends_last else "miss")
+    start = (
+        "exact"
+        if (extends_last and st["ids"] == ids_l)
+        else ("extension" if extends_last else "miss")
+    )
     if not extends_last:
         # старт новой сессии: прошлое состояние бесполезно (назад не откатить)
         STATE["v"] = None
@@ -341,20 +383,39 @@ def _decode_job(ids, max_tokens):
             # Гистерезис +64: не перезакреплять ради пары токенов — сам
             # префилл пина стоит ~9 секунд.
             n = min(_lcp(prev, ids_l), len(ids_l) - 8, len(prev) - 8)
-            if n >= PIN_MIN_TOKENS and (
-                    PIN["ids"] is None or n > len(PIN["ids"]) + 64):
+            if n >= PIN_MIN_TOKENS and (PIN["ids"] is None or n > len(PIN["ids"]) + 64):
                 _pin_prefix(ids_l[:n])
         LAST_INITIAL["ids"] = ids_l
-        if (PIN["ids"] and len(PIN["ids"]) < len(ids_l)
-                and ids_l[:len(PIN["ids"])] == PIN["ids"]):
+        if (
+            PIN["ids"]
+            and len(PIN["ids"]) < len(ids_l)
+            and ids_l[: len(PIN["ids"])] == PIN["ids"]
+        ):
             STATE["v"] = _restore_pin()
             start = "pin"
     STATS["requests"] += 1
     STATS["starts"][start] += 1
-    res = decode_ids(
-        MODEL, TOKENIZER, ids, max_tokens,
-        use_mtp=USE_MTP, state=STATE["v"],
-    )
+    try:
+        res = decode_ids(
+            MODEL,
+            TOKENIZER,
+            ids,
+            max_tokens,
+            use_mtp=USE_MTP,
+            state=STATE["v"],
+            ssm_checkpoint=USE_CHECKPOINT_MTP,
+            mtp_depth=MTP_DEPTH,
+        )
+        if USE_CHECKPOINT_MTP and (
+            not res["ssm_checkpoint_enabled"]
+            or res["ssm_checkpointed"] != res["attempted"] - res["accepted"]
+        ):
+            raise RuntimeError("Checkpoint MTP did not recover every rejected draft")
+    except Exception:
+        # decode_ids may already have mutated the previous cache by reference.
+        if USE_CHECKPOINT_MTP:
+            STATE["v"] = None
+        raise
     STATE["v"] = res["state"]
     STATS["gen_tokens"] += res["n_gen"]
     STATS["attempted"] += res["attempted"]
@@ -397,6 +458,13 @@ def usage_from(res):
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
+    def setup(self):
+        super().setup()
+        if USE_CHECKPOINT_MTP:
+            # Non-daemon handlers must not wait forever on idle HTTP/1.1 sockets.
+            # This limits socket I/O waits, not generation in the MLX worker.
+            self.connection.settimeout(30)
+
     def log_message(self, *a):
         pass
 
@@ -410,19 +478,34 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         if self.path.rstrip("/").endswith("/v1/models"):
-            self._send(200, {"object": "list", "data": [
-                {"id": MODEL_ID, "object": "model", "created": 0, "owned_by": "local"}]})
+            self._send(
+                200,
+                {
+                    "object": "list",
+                    "data": [
+                        {
+                            "id": MODEL_ID,
+                            "object": "model",
+                            "created": 0,
+                            "owned_by": "local",
+                        }
+                    ],
+                },
+            )
         elif self.path.startswith("/health"):
             self._send(200, {"status": "ok"})
         elif self.path.startswith("/metrics"):
             att = STATS["attempted"]
-            self._send(200, {
-                **{k: v for k, v in STATS.items() if k != "started_at"},
-                "accept_rate": STATS["accepted"] / att if att else None,
-                "uptime_s": round(time.time() - STATS["started_at"], 1),
-                "model": MODEL_ID,
-                "pin_tokens": len(PIN["ids"]) if PIN["ids"] else 0,
-            })
+            self._send(
+                200,
+                {
+                    **{k: v for k, v in STATS.items() if k != "started_at"},
+                    "accept_rate": STATS["accepted"] / att if att else None,
+                    "uptime_s": round(time.time() - STATS["started_at"], 1),
+                    "model": MODEL_ID,
+                    "pin_tokens": len(PIN["ids"]) if PIN["ids"] else 0,
+                },
+            )
         else:
             self._send(404, {"error": {"message": "not found"}})
 
@@ -430,13 +513,17 @@ class Handler(BaseHTTPRequestHandler):
         if "chat/completions" not in self.path:
             return self._send(404, {"error": {"message": "not found"}})
         try:
-            body = json.loads(self.rfile.read(int(self.headers.get("Content-Length", 0))))
+            body = json.loads(
+                self.rfile.read(int(self.headers.get("Content-Length", 0)))
+            )
         except Exception:
             return self._send(400, {"error": {"message": "invalid JSON"}})
 
         messages = body.get("messages", [])
         tools = body.get("tools")
-        max_tokens = int(body.get("max_tokens") or body.get("max_completion_tokens") or 1024)
+        max_tokens = int(
+            body.get("max_tokens") or body.get("max_completion_tokens") or 1024
+        )
         stream = bool(body.get("stream"))
 
         t0 = time.time()
@@ -444,26 +531,40 @@ class Handler(BaseHTTPRequestHandler):
             res = generate(messages, tools, max_tokens)
         except Exception as e:
             import traceback
+
             traceback.print_exc()
             return self._send(500, {"error": {"message": f"{type(e).__name__}: {e}"}})
 
-        print(f"req prompt={res['n_prompt']} cached={res['cached_tokens']} "
-              f"gen={res['n_gen']} {time.time()-t0:.1f}s "
-              f"gen={res['gen_tok_s']:.1f} tok/s accept={100*res['accept_rate']:.0f}% "
-              f"tools={len(res['tool_calls'])}", flush=True)
+        print(
+            f"req prompt={res['n_prompt']} cached={res['cached_tokens']} "
+            f"gen={res['n_gen']} {time.time() - t0:.1f}s "
+            f"gen={res['gen_tok_s']:.1f} tok/s accept={100 * res['accept_rate']:.0f}% "
+            f"tools={len(res['tool_calls'])}",
+            flush=True,
+        )
 
         cid = f"chatcmpl-{uuid.uuid4().hex[:12]}"
         created = int(t0)
         finish = "tool_calls" if res["tool_calls"] else "stop"
 
         if not stream:
-            return self._send(200, {
-                "id": cid, "object": "chat.completion", "created": created,
-                "model": MODEL_ID,
-                "choices": [{"index": 0, "message": message_from(res),
-                             "finish_reason": finish}],
-                "usage": usage_from(res),
-            })
+            return self._send(
+                200,
+                {
+                    "id": cid,
+                    "object": "chat.completion",
+                    "created": created,
+                    "model": MODEL_ID,
+                    "choices": [
+                        {
+                            "index": 0,
+                            "message": message_from(res),
+                            "finish_reason": finish,
+                        }
+                    ],
+                    "usage": usage_from(res),
+                },
+            )
 
         # SSE: цикл не потоковый, поэтому отдаём готовый ответ чанками.
         # Поток закрываем разрывом соединения — Content-Length тут не задать.
@@ -476,13 +577,19 @@ class Handler(BaseHTTPRequestHandler):
 
         def chunk(delta, finish_reason=None, usage=None):
             payload = {
-                "id": cid, "object": "chat.completion.chunk", "created": created,
+                "id": cid,
+                "object": "chat.completion.chunk",
+                "created": created,
                 "model": MODEL_ID,
-                "choices": [{"index": 0, "delta": delta, "finish_reason": finish_reason}],
+                "choices": [
+                    {"index": 0, "delta": delta, "finish_reason": finish_reason}
+                ],
             }
             if usage is not None:
                 payload["usage"] = usage
-            self.wfile.write(f"data: {json.dumps(payload, ensure_ascii=False)}\n\n".encode())
+            self.wfile.write(
+                f"data: {json.dumps(payload, ensure_ascii=False)}\n\n".encode()
+            )
 
         chunk({"role": "assistant"})
         if res.get("reasoning"):
@@ -497,33 +604,75 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.flush()
 
 
-def main():
-    global MODEL, TOKENIZER, MODEL_ID, USE_MTP
+def main(argv=None):
+    global MODEL, TOKENIZER, MODEL_ID, USE_MTP, USE_CHECKPOINT_MTP, MTP_DEPTH
     ap = argparse.ArgumentParser(prog="mtpserve")
-    ap.add_argument("--model", required=True,
-                    help="путь к MLX-модели (с mtp/weights.safetensors для MTP)")
+    ap.add_argument(
+        "--model",
+        required=True,
+        help="путь к MLX-модели (с mtp/weights.safetensors для MTP)",
+    )
     ap.add_argument("--port", type=int, default=19234)
-    ap.add_argument("--no-mtp", action="store_true")
-    a = ap.parse_args()
+    mode = ap.add_mutually_exclusive_group()
+    mode.add_argument("--no-mtp", action="store_true")
+    mode.add_argument(
+        "--checkpoint-mtp",
+        action="store_true",
+        help="experimental Q4 verification and reject-state checkpoints",
+    )
+    ap.add_argument(
+        "--mtp-depth",
+        type=int,
+        choices=(1, 2),
+        default=1,
+        help="number of draft tokens per verification (default: 1)",
+    )
+    a = ap.parse_args(argv)
+    if a.no_mtp and a.mtp_depth != 1:
+        ap.error("--mtp-depth requires MTP")
 
     USE_MTP = not a.no_mtp
+    USE_CHECKPOINT_MTP = a.checkpoint_mtp
+    MTP_DEPTH = a.mtp_depth
     MODEL_ID = a.model
 
     t = time.time()
-    MODEL, TOKENIZER = load_model(
-        a.model, tokenizer_config={"eos_token": "<|im_end|>"})
+    MODEL, TOKENIZER = load_model(a.model, tokenizer_config={"eos_token": "<|im_end|>"})
     raise_wired_limit()
     has_mtp = getattr(MODEL, "mtp", None) is not None
-    print(f"модель загружена за {time.time()-t:.1f}s, mtp={has_mtp}, "
-          f"use_mtp={USE_MTP}", flush=True)
+    print(
+        f"модель загружена за {time.time() - t:.1f}s, mtp={has_mtp}, use_mtp={USE_MTP}",
+        flush=True,
+    )
     if USE_MTP and not has_mtp:
         print("ВНИМАНИЕ: MTP-голова не найдена, идём без спекуляции", flush=True)
 
-    _load_pin()
+    context = nullcontext()
+    if USE_CHECKPOINT_MTP:
+        if not has_mtp or not getattr(MODEL, "supports_ssm_checkpoint", False):
+            raise ValueError(
+                "--checkpoint-mtp requires an MTP head and SSM checkpoint support"
+            )
+        from .q4_pair import paired_quantized_linears
 
-    srv = ThreadingHTTPServer(("127.0.0.1", a.port), Handler)
-    print(f"READY http://127.0.0.1:{a.port}", flush=True)
-    srv.serve_forever()
+        context = paired_quantized_linears(
+            MODEL, verification_only=True, verification_rows=MTP_DEPTH + 1
+        )
+
+    with context as report:
+        if USE_CHECKPOINT_MTP and report["patched_projection_count"] <= 0:
+            raise ValueError("--checkpoint-mtp requires paired Q4 projections")
+        _load_pin()
+
+        srv = ThreadingHTTPServer(("127.0.0.1", a.port), Handler)
+        if USE_CHECKPOINT_MTP:
+            # Keep patched classes until every active request has completed.
+            srv.daemon_threads = False
+        try:
+            print(f"READY http://127.0.0.1:{a.port}", flush=True)
+            srv.serve_forever()
+        finally:
+            srv.server_close()
 
 
 if __name__ == "__main__":

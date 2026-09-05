@@ -116,7 +116,7 @@ def _mtp_artifact_uses_mlx_norm_weights(mtp_weights_path: Path) -> bool:
 def _mtp_quantization_companion_key(key: str, suffix: str) -> str:
     """Return the scale/bias key for both standard and fused Qwen tensors."""
     if key.endswith(".weight"):
-        return f"{key[:-len('.weight')]}.{suffix}"
+        return f"{key[: -len('.weight')]}.{suffix}"
     return f"{key}.{suffix}"
 
 
@@ -473,12 +473,17 @@ def inject_mtp_support(model: Any, model_path, config: dict) -> bool:
     class _Qwen3_5MTP(original_class):
         """Qwen3.5 with MTP support (injected at runtime)."""
 
+        supports_ssm_recovery = True
+        supports_ssm_checkpoint = True
+
         def __call__(
             self,
             inputs,
             cache=None,
             return_hidden: bool = False,
             input_embeddings=None,
+            ssm_inputs=None,
+            ssm_checkpoints=None,
             **kwargs,
         ):
             inner = self.model
@@ -492,10 +497,38 @@ def inject_mtp_support(model: Any, model_path, config: dict) -> bool:
 
             fa_mask = create_attention_mask(hidden_states, cache[inner.fa_idx])
             ssm_mask = create_ssm_mask(hidden_states, cache[inner.ssm_idx])
+            if ssm_checkpoints is not None:
+                from .qwen3_5_checkpoint import (
+                    linear_attention_checkpoint,
+                    validate_checkpoint_contract,
+                )
 
-            for layer, c in zip(inner.layers, cache):
+                if ssm_mask is not None:
+                    raise ValueError(
+                        "SSM checkpoint does not support masked verification"
+                    )
+                for layer, c in zip(inner.layers, cache):
+                    if layer.is_linear:
+                        validate_checkpoint_contract(
+                            layer.linear_attn,
+                            hidden_states.shape,
+                            hidden_states.dtype,
+                            c,
+                        )
+
+            for i, (layer, c) in enumerate(zip(inner.layers, cache)):
                 mask = ssm_mask if layer.is_linear else fa_mask
-                hidden_states = layer(hidden_states, mask=mask, cache=c)
+                if ssm_inputs is not None and layer.is_linear:
+                    ssm_inputs[i] = hidden_states[:, :1, :]
+                if ssm_checkpoints is not None and layer.is_linear:
+                    r, checkpoint = linear_attention_checkpoint(
+                        layer.linear_attn, layer.input_layernorm(hidden_states), c
+                    )
+                    h = hidden_states + r
+                    hidden_states = h + layer.mlp(layer.post_attention_layernorm(h))
+                    ssm_checkpoints[i] = checkpoint
+                else:
+                    hidden_states = layer(hidden_states, mask=mask, cache=c)
 
             normed = inner.norm(hidden_states)
 
@@ -518,8 +551,13 @@ def inject_mtp_support(model: Any, model_path, config: dict) -> bool:
             next_token_ids,
             cache=None,
             mtp_cache=None,
+            *,
+            last_only=False,
         ):
-            """Run MTP head: predict token n+2 from hidden states + token n+1."""
+            """Predict token n+2, optionally projecting only the final position.
+
+            Every input position still advances the MTP decoder and its cache.
+            """
             input_embeds = self.model.embed_tokens(next_token_ids)
             e = self.mtp.pre_fc_norm_embedding(input_embeds)
             h = self.mtp.pre_fc_norm_hidden(hidden_states)
@@ -530,6 +568,8 @@ def inject_mtp_support(model: Any, model_path, config: dict) -> bool:
             mask = create_attention_mask(x, c)
             x = layer(x, mask=mask, cache=c)
 
+            if last_only:
+                x = x[:, -1:, :]
             x = self.mtp.norm(x)
 
             if self.args.tie_word_embeddings:
