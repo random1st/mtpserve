@@ -20,6 +20,7 @@ class ServerCheckpointTests(unittest.TestCase):
             if isinstance(node, ast.FunctionDef) and node.name in (
                 "main",
                 "_decode_job",
+                "_idle_timeout",
             ):
                 selected.append(node)
             elif isinstance(node, ast.Assign) and any(
@@ -60,7 +61,7 @@ class ServerCheckpointTests(unittest.TestCase):
             load_model=Mock(side_effect=lambda *a, **kw: (self.model, object())),
             raise_wired_limit=Mock(),
             _load_pin=lambda: self.event("pin"),
-            ThreadingHTTPServer=lambda *a: self.bind(),
+            IdleUnloadingHTTPServer=lambda *a, **kw: self.bind(),
             Handler=object,
             decode_ids=Mock(return_value=self.result),
             STATS=dict(

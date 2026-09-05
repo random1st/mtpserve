@@ -44,10 +44,16 @@ uv run python scripts/add_mtp_weights.py \
     --source-model Qwen/Qwen3.8-27B --no-quantize
 
 uv run mtpserve --model /path/to/your-mlx-model --port 19234
+# Stop five minutes after the last completed request and release model memory:
+uv run mtpserve --model /path/to/your-mlx-model --idle-timeout 300
 ```
 
 The MTP head must stay in BF16 (`--no-quantize`): quantizing it collapses
 draft acceptance to zero.
+
+`--idle-timeout` exits the server after that many seconds without requests;
+process exit releases the model from unified memory. It is disabled by default
+(`0`) so long-running server behavior stays unchanged.
 
 ## Endpoints
 

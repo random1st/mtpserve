@@ -14,8 +14,10 @@
 
 import argparse
 from contextlib import nullcontext
+from functools import wraps
 import hashlib
 import json
+import math
 import os
 import re
 import threading
@@ -73,6 +75,76 @@ def run_in_worker(fn, *args):
     if "err" in out:
         raise out["err"]
     return out["res"]
+
+
+class IdleUnloadingHTTPServer(ThreadingHTTPServer):
+    """Stop the process after a request-free interval, releasing model memory.
+
+    ``serve_forever`` runs ``service_actions`` in its own thread.  Calling
+    ``shutdown`` directly from there would deadlock, so expiry hands it to a
+    separate short-lived thread.  Request accounting lives around endpoint
+    handling, not a socket lifetime: an idle HTTP keep-alive connection must
+    not hold a loaded model indefinitely.
+    """
+
+    def __init__(self, server_address, request_handler_class, *, idle_timeout=0):
+        super().__init__(server_address, request_handler_class)
+        self.idle_timeout = idle_timeout
+        self._idle_lock = threading.Lock()
+        self._active_requests = 0
+        self._idle_since = time.monotonic()
+        self._idle_shutdown_started = False
+
+    def request_started(self):
+        with self._idle_lock:
+            self._active_requests += 1
+            self._idle_since = None
+
+    def request_finished(self):
+        with self._idle_lock:
+            if self._active_requests <= 0:
+                raise RuntimeError("HTTP request activity underflow")
+            self._active_requests -= 1
+            if self._active_requests == 0:
+                self._idle_since = time.monotonic()
+
+    def service_actions(self):
+        super().service_actions()
+        with self._idle_lock:
+            expired = (
+                self.idle_timeout > 0
+                and self._active_requests == 0
+                and self._idle_since is not None
+                and time.monotonic() - self._idle_since >= self.idle_timeout
+                and not self._idle_shutdown_started
+            )
+            if expired:
+                self._idle_shutdown_started = True
+        if expired:
+            print(
+                f"idle timeout ({self.idle_timeout:g}s): unloading model and stopping server",
+                flush=True,
+            )
+            threading.Thread(
+                target=self.shutdown, name="mtpserve-idle-shutdown", daemon=True
+            ).start()
+
+
+def _track_request_activity(endpoint):
+    """Keep an idle timer accurate for completed HTTP requests only."""
+
+    @wraps(endpoint)
+    def tracked(self, *args, **kwargs):
+        tracker = getattr(self.server, "request_started", None)
+        if tracker is None:
+            return endpoint(self, *args, **kwargs)
+        tracker()
+        try:
+            return endpoint(self, *args, **kwargs)
+        finally:
+            self.server.request_finished()
+
+    return tracked
 
 
 TOOL_CALL_RE = re.compile(r"<tool_call>\s*(\{.*?\})\s*</tool_call>", re.S)
@@ -476,6 +548,7 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(blob)
 
+    @_track_request_activity
     def do_GET(self):
         if self.path.rstrip("/").endswith("/v1/models"):
             self._send(
@@ -509,6 +582,7 @@ class Handler(BaseHTTPRequestHandler):
         else:
             self._send(404, {"error": {"message": "not found"}})
 
+    @_track_request_activity
     def do_POST(self):
         if "chat/completions" not in self.path:
             return self._send(404, {"error": {"message": "not found"}})
@@ -604,6 +678,16 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.flush()
 
 
+def _idle_timeout(value):
+    try:
+        seconds = float(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be a number of seconds") from exc
+    if not math.isfinite(seconds) or not 0 <= seconds <= 86400:
+        raise argparse.ArgumentTypeError("must be between 0 and 86400 seconds")
+    return seconds
+
+
 def main(argv=None):
     global MODEL, TOKENIZER, MODEL_ID, USE_MTP, USE_CHECKPOINT_MTP, MTP_DEPTH
     ap = argparse.ArgumentParser(prog="mtpserve")
@@ -613,6 +697,13 @@ def main(argv=None):
         help="путь к MLX-модели (с mtp/weights.safetensors для MTP)",
     )
     ap.add_argument("--port", type=int, default=19234)
+    ap.add_argument(
+        "--idle-timeout",
+        type=_idle_timeout,
+        default=0,
+        metavar="SECONDS",
+        help="stop the server and release model memory after SECONDS without requests (0 disables; default: 0)",
+    )
     mode = ap.add_mutually_exclusive_group()
     mode.add_argument("--no-mtp", action="store_true")
     mode.add_argument(
@@ -664,7 +755,9 @@ def main(argv=None):
             raise ValueError("--checkpoint-mtp requires paired Q4 projections")
         _load_pin()
 
-        srv = ThreadingHTTPServer(("127.0.0.1", a.port), Handler)
+        srv = IdleUnloadingHTTPServer(
+            ("127.0.0.1", a.port), Handler, idle_timeout=a.idle_timeout
+        )
         if USE_CHECKPOINT_MTP:
             # Keep patched classes until every active request has completed.
             srv.daemon_threads = False
